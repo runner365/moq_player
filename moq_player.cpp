@@ -92,10 +92,6 @@ const char* ResultName(moqt_result_t r) {
     }
 }
 
-const char* CodecName(moqt_codec_t c) {
-    return c == MOQT_CODEC_H264 ? "H264" : "AAC";
-}
-
 /* 最多打印 n 字节的十六进制预览 */
 std::string HexPreview(const uint8_t* p, size_t len, size_t n = 16) {
     static const char* kHex = "0123456789abcdef";
@@ -112,6 +108,48 @@ std::string HexPreview(const uint8_t* p, size_t len, size_t n = 16) {
 }
 
 /* 解析 avcC，返回 profile/level 与 SPS/PPS 概况 */
+/* 视频轨判定：H.264 与 H.265 都算视频轨（SDK 从 eaa6dd3 起会正确区分两者） */
+inline bool IsVideoCodec(moqt_codec_t c) {
+    return c == MOQT_CODEC_H264 || c == MOQT_CODEC_H265;
+}
+
+/* 视频配置记录的种类（仅用于日志格式与一致性校验）。
+ * 编码以 moqt_stream_t::codec 为准，这里只识别格式用于打印与校验：
+ *   avcC（H.264）: version=1，byte4 低 2 位 = NAL 长度-1，随后是 SPS/PPS 列表
+ *   hvcC（H.265）: version=1，byte21 低 2 位 = NAL 长度-1，byte22 = 数组个数
+ * 两者的内部结构完全不同，可以可靠区分（不能只看 version 字节，那都是 1）。 */
+enum class ConfigKind { kAvcC, kHvcC, kUnknown };
+
+ConfigKind SniffVideoConfig(const uint8_t* c, size_t n) {
+    if (!c || n < 8 || c[0] != 1) return ConfigKind::kUnknown;
+
+    /* avcC：numOfSPS 保留位必须全 1，紧跟的 SPS 长度要自洽，且首个 NAL 是 type 7 */
+    if ((c[4] & 0xFC) == 0xFC && (c[5] & 0xE0) == 0xE0) {
+        const unsigned sps_len = (static_cast<unsigned>(c[6]) << 8) | c[7];
+        if (sps_len > 0 && n >= 9 && (c[8] & 0x1F) == 7) return ConfigKind::kAvcC;
+    }
+
+    /* hvcC：byte21 = 11111 | lengthSizeMinusOne(2 位)，byte22 = 数组个数（1~3）。
+     * 注意保留位是 **5 个 1**，掩掉低 3 位后应为 0xF8（写成 0xF0 会永远不命中）。 */
+    if (n >= 25 && (c[21] & 0xF8) == 0xF8 && c[22] >= 1 && c[22] <= 4) {
+        const unsigned t = c[23] & 0x3F;
+        if (t == 32 || t == 33 || t == 34) return ConfigKind::kHvcC;
+    }
+    return ConfigKind::kUnknown;
+}
+
+/* SDK 报的 codec 与配置记录格式不一致时告警（不改变播放行为） */
+void WarnIfCodecMismatch(moqt_codec_t codec, ConfigKind kind) {
+    if (kind == ConfigKind::kUnknown) return;   /* 认不出就不下结论 */
+    const bool sdk_hevc = (codec == MOQT_CODEC_H265);
+    const bool cfg_hevc = (kind == ConfigKind::kHvcC);
+    if (sdk_hevc != cfg_hevc) {
+        LOG_WARN("编码不一致：SDK 报 %s，但配置记录是 %s（按 SDK 处理）",
+                 sdk_hevc ? "H.265" : "H.264",
+                 cfg_hevc ? "hvcC" : "avcC");
+    }
+}
+
 std::string DescribeAvcC(const uint8_t* c, size_t n) {
     char buf[512];
     if (n < 7) {
@@ -178,7 +216,7 @@ std::string DescribeAsc(const uint8_t* c, size_t n) {
 }
 
 /* 解析 AVCC 包内第一个 NAL 的类型 */
-std::string DescribeFirstNal(const uint8_t* d, size_t len) {
+std::string DescribeFirstNal(const uint8_t* d, size_t len, bool hevc) {
     char buf[96];
     if (len < 5) return std::string();
 
@@ -187,20 +225,39 @@ std::string DescribeFirstNal(const uint8_t* d, size_t len) {
                              (static_cast<uint32_t>(d[2]) << 8) |
                               static_cast<uint32_t>(d[3]);
     if (nal_len == 0 || nal_len > len - 4) {
-        snprintf(buf, sizeof(buf), "nal_len=%u 非AVCC?", nal_len);
+        snprintf(buf, sizeof(buf), "nal_len=%u 与长度前缀不符", nal_len);
         return buf;
     }
 
-    const unsigned type = d[4] & 0x1F;
+    /* H.264: 1 字节头，type = 低 5 位
+     * H.265: 2 字节头，type = 第 1 字节的 bit1..bit6 */
+    const unsigned type = hevc ? ((d[4] >> 1) & 0x3F) : (d[4] & 0x1F);
     const char* name = "other";
-    switch (type) {
-        case 1:  name = "non-IDR"; break;
-        case 5:  name = "IDR";     break;
-        case 6:  name = "SEI";     break;
-        case 7:  name = "SPS";     break;
-        case 8:  name = "PPS";     break;
-        case 9:  name = "AUD";     break;
-        default: break;
+    if (hevc) {
+        switch (type) {
+            case 0: case 1:  name = "TRAIL";    break;
+            case 19:         name = "IDR_W_RADL"; break;
+            case 20:         name = "IDR_N_LP"; break;
+            case 21:         name = "CRA";      break;
+            case 32:         name = "VPS";      break;
+            case 33:         name = "SPS";      break;
+            case 34:         name = "PPS";      break;
+            case 35:         name = "AUD";      break;
+            case 39:         name = "SEI";      break;
+            default:
+                if (type >= 16 && type <= 23) name = "IRAP";
+                break;
+        }
+    } else {
+        switch (type) {
+            case 1:  name = "non-IDR"; break;
+            case 5:  name = "IDR";     break;
+            case 6:  name = "SEI";     break;
+            case 7:  name = "SPS";     break;
+            case 8:  name = "PPS";     break;
+            case 9:  name = "AUD";     break;
+            default: break;
+        }
     }
     snprintf(buf, sizeof(buf), "nal_len=%u type=%u %s", nal_len, type, name);
     return buf;
@@ -253,6 +310,9 @@ struct App {
     /* --- 解码器 --- */
     std::unique_ptr<VideoDecoder> vdec;
     std::unique_ptr<AudioDecoder> adec;
+    /* 视频实际编码：直接来自 SDK 的 moqt_stream_t::codec */
+    VideoCodec vcodec = VideoCodec::kH264;
+    ConfigKind vconfig_kind = ConfigKind::kUnknown;
 
     /* 音频 pts 自己按样本数推进：avfilter 重采样后 pts 不可靠 */
     bool    audio_pts_seeded = false;
@@ -369,10 +429,57 @@ void OnAudioFrame(App* a, AVFrame* f) {
 
 /* ------------------------- 报文日志 ------------------------- */
 
+std::string DescribeHvcC(const uint8_t* c, size_t n) {
+    char buf[512];
+    if (n < 23) {
+        snprintf(buf, sizeof(buf), "hvcC 过短（%zu 字节），无法解析", n);
+        return buf;
+    }
+    const unsigned profile_space = (c[1] >> 6) & 0x03;
+    const unsigned tier          = (c[1] >> 5) & 0x01;
+    const unsigned profile_idc   = c[1] & 0x1F;
+    const unsigned level_idc     = c[12];
+    const unsigned nalu_len      = (c[21] & 0x03) + 1;
+    const unsigned n_arrays      = c[22];
+
+    std::string out;
+    snprintf(buf, sizeof(buf),
+             "hvcC: profile_idc=%u tier=%s level=%u(%.1f) nal_length=%u arrays=%u",
+             profile_idc, tier ? "high" : "main", level_idc,
+             level_idc / 30.0, nalu_len, n_arrays);
+    out += buf;
+    if (profile_space) {
+        snprintf(buf, sizeof(buf), " profile_space=%u", profile_space);
+        out += buf;
+    }
+
+    /* 遍历数组头：VPS(32) / SPS(33) / PPS(34) 各多少个 */
+    size_t off = 23;
+    for (unsigned i = 0; i < n_arrays && off + 3 <= n; i++) {
+        const unsigned type  = c[off] & 0x3F;
+        const unsigned count = (static_cast<unsigned>(c[off + 1]) << 8) | c[off + 2];
+        static const char* kNames[] = {"?","?","?","?","?","?","?","?","?","?","?","?",
+                                       "?","?","?","?","?","?","?","?","?","?","?","?",
+                                       "?","?","?","?","?","?","?","?","VPS","SPS","PPS"};
+        const char* nm = (type < 35) ? kNames[type] : "?";
+        snprintf(buf, sizeof(buf), " %s=%u", nm, count);
+        out += buf;
+        off += 3;
+        for (unsigned k = 0; k < count && off + 2 <= n; k++) {
+            const unsigned len = (static_cast<unsigned>(c[off]) << 8) | c[off + 1];
+            off += 2 + len;
+        }
+    }
+
+    out += " | hex=";
+    out += HexPreview(c, n, 24);
+    return out;
+}
+
 void LogObject(App* a, moqt_stream_t* s, const uint8_t* data, size_t len,
                int64_t dts_ms, int64_t pts_ms, int keyframe) {
     const moqt_codec_t codec = moqt_stream_codec(s);
-    TrackStat& st = (codec == MOQT_CODEC_H264) ? a->video : a->audio;
+    TrackStat& st = IsVideoCodec(codec) ? a->video : a->audio;
 
     st.objects++;
     st.bytes += len;
@@ -392,12 +499,16 @@ void LogObject(App* a, moqt_stream_t* s, const uint8_t* data, size_t len,
     int n = snprintf(line, sizeof(line),
                      "recv %-4s #%-5" PRIu64 " %6zu B  dts=%6" PRId64
                      "ms  pts=%6" PRId64 "ms  %s",
-                     CodecName(codec), st.objects, len, dts_ms, pts_ms,
+                     IsVideoCodec(codec)
+                         ? (a->vcodec == VideoCodec::kH265 ? "H265" : "H264")
+                         : "AAC",
+                     st.objects, len, dts_ms, pts_ms,
                      keyframe ? "KEY" : "   ");
     if (n < 0) return;
 
-    if (codec == MOQT_CODEC_H264 && n < (int)sizeof(line)) {
-        const std::string nal = DescribeFirstNal(data, len);
+    if (IsVideoCodec(codec) && n < (int)sizeof(line)) {
+        const std::string nal =
+            DescribeFirstNal(data, len, a->vcodec == VideoCodec::kH265);
         if (!nal.empty()) {
             snprintf(line + n, sizeof(line) - n, "  [%s]", nal.c_str());
         }
@@ -426,17 +537,34 @@ void OnConnected(moqt_client_t*, moqt_result_t status,
 void OnStreamReady(moqt_client_t*, moqt_stream_t* s,
                    const moqt_stream_info_t* info, void* user) {
     App* a = static_cast<App*>(user);
-    TrackStat& st = (info->codec == MOQT_CODEC_H264) ? a->video : a->audio;
+    TrackStat& st = IsVideoCodec(info->codec) ? a->video : a->audio;
 
-    LOG_INFO("轨道就绪: %-4s track=%s config=%zu 字节",
-             CodecName(info->codec),
+    /* 编码判定只看 SDK 上报的 codec（moqt_stream_t::codec）。
+     * 配置记录只用来选日志格式并做一致性校验：两者不符说明上游判定或配置有异常，
+     * 记一条告警便于排查，但不改变播放行为。 */
+    if (IsVideoCodec(info->codec)) {
+        a->vcodec = (info->codec == MOQT_CODEC_H265) ? VideoCodec::kH265
+                                                     : VideoCodec::kH264;
+        if (info->config && info->config_len > 0) {
+            a->vconfig_kind = SniffVideoConfig(info->config, info->config_len);
+            WarnIfCodecMismatch(info->codec, a->vconfig_kind);
+        }
+    }
+
+    LOG_INFO("轨道就绪: %-6s track=%s config=%zu 字节",
+             IsVideoCodec(info->codec) ? VideoCodecName(a->vcodec) : "AAC",
              info->track_name ? info->track_name : "?",
              info->config_len);
 
     if (info->config && info->config_len > 0 && !st.config_logged) {
-        const std::string desc = (info->codec == MOQT_CODEC_H264)
-                                     ? DescribeAvcC(info->config, info->config_len)
-                                     : DescribeAsc(info->config, info->config_len);
+        std::string desc;
+        if (IsVideoCodec(info->codec)) {
+            desc = (a->vconfig_kind == ConfigKind::kHvcC)
+                       ? DescribeHvcC(info->config, info->config_len)
+                       : DescribeAvcC(info->config, info->config_len);
+        } else {
+            desc = DescribeAsc(info->config, info->config_len);
+        }
         LOG_INFO("%s", desc.c_str());
         st.config_logged = true;
     }
@@ -444,15 +572,23 @@ void OnStreamReady(moqt_client_t*, moqt_stream_t* s,
     if (!info->config || info->config_len == 0) return;
 
     std::string err;
-    if (info->codec == MOQT_CODEC_H264) {
+    if (IsVideoCodec(info->codec)) {
         if (!a->vdec) {
+            if (a->vconfig_kind == ConfigKind::kUnknown) {
+                LOG_WARN("视频配置记录格式无法识别，按 H.264 尝试解码"
+                         "（config=%zu 字节，hex=%s）",
+                         info->config_len, HexPreview(info->config, info->config_len, 16).c_str());
+            }
+
             a->vdec.reset(new VideoDecoder());
             a->vdec->SetFrameCallback([a](AVFrame* f) { OnVideoFrame(a, f); });
-            if (!a->vdec->Init(info->config, info->config_len, &err)) {
+            if (!a->vdec->Init(a->vcodec, info->config, info->config_len, &err)) {
                 LOG_ERROR("视频解码器初始化失败: %s", err.c_str());
                 a->vdec.reset();
             } else {
-                LOG_INFO("视频解码器已就绪（H.264 / avcC）");
+                LOG_INFO("视频解码器已就绪（%s / %s）",
+                         VideoCodecName(a->vcodec),
+                         a->vconfig_kind == ConfigKind::kHvcC ? "hvcC" : "avcC");
             }
         }
     } else {
@@ -484,11 +620,20 @@ void OnData(moqt_client_t*, moqt_stream_t* s,
     if (cfg && cfg_len == len && memcmp(cfg, data, len) == 0) {
         /* 纯 config 对象，不是媒体数据 */
         const moqt_codec_t codec = moqt_stream_codec(s);
-        TrackStat& st = (codec == MOQT_CODEC_H264) ? a->video : a->audio;
+        TrackStat& st = IsVideoCodec(codec) ? a->video : a->audio;
         if (!st.config_logged) {
-            const std::string desc = (codec == MOQT_CODEC_H264)
-                                         ? DescribeAvcC(cfg, cfg_len)
-                                         : DescribeAsc(cfg, cfg_len);
+            std::string desc;
+            if (IsVideoCodec(codec)) {
+                a->vcodec = (codec == MOQT_CODEC_H265) ? VideoCodec::kH265
+                                                       : VideoCodec::kH264;
+                a->vconfig_kind = SniffVideoConfig(cfg, cfg_len);
+                WarnIfCodecMismatch(codec, a->vconfig_kind);
+                desc = (a->vconfig_kind == ConfigKind::kHvcC)
+                           ? DescribeHvcC(cfg, cfg_len)
+                           : DescribeAvcC(cfg, cfg_len);
+            } else {
+                desc = DescribeAsc(cfg, cfg_len);
+            }
             LOG_INFO("%s", desc.c_str());
             st.config_logged = true;
         }
@@ -503,17 +648,17 @@ void OnData(moqt_client_t*, moqt_stream_t* s,
     /* 到达侧跳变检测：直播流里 pts 突然前跳或倒退，是卡顿、音画错位的先兆。
      * 视频帧间隔 ~40ms、音频 ~21ms，超过 200ms 的空档或任何倒退都记一笔。 */
     {
-        int64_t* last = (codec == MOQT_CODEC_H264) ? &a->in_last_v_pts
+        int64_t* last = IsVideoCodec(codec) ? &a->in_last_v_pts
                                                    : &a->in_last_a_pts;
-        const char* nm = (codec == MOQT_CODEC_H264) ? "video" : "audio";
+        const char* nm = IsVideoCodec(codec) ? "video" : "audio";
         if (*last >= 0) {
             const int64_t d = pts_ms - *last;
             if (d < 0) {
-                if (codec == MOQT_CODEC_H264) a->in_v_backwards++;
+                if (IsVideoCodec(codec)) a->in_v_backwards++;
                 LOG_DEBUG("[evt] %s pts 倒退: %" PRId64 " -> %" PRId64
                           " (Δ=%+" PRId64 "ms)", nm, *last, pts_ms, d);
             } else if (d > 200) {
-                if (codec == MOQT_CODEC_H264) a->in_v_jumps++; else a->in_a_jumps++;
+                if (IsVideoCodec(codec)) a->in_v_jumps++; else a->in_a_jumps++;
                 LOG_INFO("[evt] %s pts 前跳: %" PRId64 " -> %" PRId64
                          " (Δ=%+" PRId64 "ms)", nm, *last, pts_ms, d);
             }
@@ -521,7 +666,7 @@ void OnData(moqt_client_t*, moqt_stream_t* s,
         *last = pts_ms;
     }
 
-    if (codec == MOQT_CODEC_H264) {
+    if (IsVideoCodec(codec)) {
         if (a->vdec) a->vdec->Decode(data, len, dts_ms, pts_ms, keyframe != 0);
     } else {
         if (!a->audio_pts_seeded) a->audio_first_pts = pts_ms;

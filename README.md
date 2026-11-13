@@ -18,7 +18,8 @@ The protocol layer is the upstream C SDK [`runner365/moqlivecast`](https://githu
 ## Features
 
 - **Pull**: SUBSCRIBE to `app/stream`; parses `avcC` / AudioSpecificConfig and logs the codec parameters
-- **Decode**: FFmpeg 8.0.1 — H.264 to YUV420P, AAC to PCM; no Annex-B or ADTS conversion anywhere
+- **Decode**: FFmpeg 8.0.1 — **H.264 / H.265 (HEVC)** video and AAC audio, producing YUV420P and PCM; no Annex-B or ADTS conversion anywhere
+- **Codec selection**: taken straight from the SDK's `moqt_stream_t::codec` (`MOQT_CODEC_H264` / `MOQT_CODEC_H265`); the config record is only used for log formatting and a consistency warning — no command-line switch needed
 - **Audio resampling**: `avfilter` (`aresample` + `aformat`) converts 44.1kHz FLTP into device-ready 48kHz stereo F32
 - **Rendering**: SDL3 `SDL_UpdateYUVTexture` consumes YUV420P directly — no swscale RGB conversion
 - **A/V sync**: optional. Default is passthrough (lowest latency); with `--av-sync N` it pre-buffers N ms and aligns video to the master clock by pts
@@ -31,7 +32,7 @@ The protocol layer is the upstream C SDK [`runner365/moqlivecast`](https://githu
 | CMake | ≥ 3.16 | System install |
 | C++ compiler | C++14 support | System toolchain (Clang / GCC) |
 | OpenSSL | **3.5+** (needs the QUIC TLS API such as `SSL_set_quic_tls_cbs`) | System install, e.g. `brew install openssl@3` |
-| FFmpeg | 8.0.1 | `3rdparty/ffmpeg.tar.gz`, built automatically by ExternalProject |
+| FFmpeg | 8.0.1 (H.264/H.265/AAC decoders, avfilter, swresample, swscale) | `3rdparty/ffmpeg.tar.gz`, built automatically by ExternalProject |
 | SDL3 | 3.4.20 | `3rdparty/SDL3-3.4.20.tar.gz`, compiled statically via `add_subdirectory` |
 | libuv | Bundled with upstream | `upstream/3rdparty/libuv` |
 | moqlivecast SDK | Commit pinned by the submodule | `upstream/` (git submodule) |
@@ -44,12 +45,7 @@ FFmpeg is built with a minimal configuration (H.264/AAC decoders + avfilter + sw
 # 1. Fetch the upstream SDK (required after the first clone)
 git submodule update --init --recursive
 
-# 2. Apply the upstream patch (a fresh submodule has no local changes;
-#    without it the process crashes on packet loss / unreachable ports)
-git -C upstream apply ../patches/0001-quic-recovery-compact-on-heap.patch 2>/dev/null \
-  || echo "patch already applied, skipping"
-
-# 3. Configure and build
+# 2. Configure and build
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8
 ```
@@ -158,8 +154,9 @@ These were confirmed by measurement, not assumed — you need them if you touch 
 
 | Item | What the SDK delivers | How we use it |
 |---|---|---|
-| Video bitstream | **AVCC**: 4-byte length prefix + NAL (not Annex-B) | Passed straight to `avcodec_send_packet`, no conversion |
-| Video config | `avcC` (contains SPS/PPS) | Used as `extradata`; FFmpeg detects AVCC mode and splits NALs internally |
+| Video codec | H.264 or **H.265 (HEVC)**, from `moqt_stream_t::codec` | Used directly to pick the decoder; a mismatch with the config record (`avcC`/`hvcC`) raises a WARN |
+| Video bitstream | **Length-prefixed NALs** (4-byte length + NAL, not Annex-B), identical for both codecs | Passed straight to `avcodec_send_packet`, no conversion |
+| Video config | `avcC` (H.264, SPS/PPS) or `hvcC` (H.265, VPS/SPS/PPS) | Used as `extradata`; FFmpeg detects length-prefix mode and splits NALs internally |
 | Audio bitstream | **Raw AAC frames**, no ADTS header | Passed straight to the decoder |
 | Audio config | AudioSpecificConfig (AAC-LC / sample rate / channels) | Used as `extradata`, and parsed locally for logging |
 | Timestamps | `dts_ms` / `pts_ms`, milliseconds | Queue ordering and sync baseline, see below |
@@ -207,7 +204,6 @@ Implementation details:
 ├── moq_render.h / moq_render.cpp        # Playback layer: FrameQueue / VideoSink / AudioSink / Player
 ├── README.md                            # This file (English)
 ├── README_cn.md                         # Chinese version
-├── patches/                             # Local modifications to upstream
 ├── 3rdparty/
 │   ├── ffmpeg.tar.gz                    # FFmpeg 8.0.1 source tarball (build input)
 │   └── SDL3-3.4.20.tar.gz               # SDL3 source tarball (build input)
@@ -215,46 +211,22 @@ Implementation details:
 └── requirement.md                       # Original requirements
 ```
 
-`upstream/` is a git submodule (managed via `.gitmodules` + a gitlink). **Do not** add it to `.gitignore`, and don't edit or delete it in place; see the next section for upstream changes.
+`upstream/` is a git submodule (managed via `.gitmodules` + a gitlink). **Do not** add it to `.gitignore`, and don't edit or delete it in place; see the next section for how to bump the pinned commit.
 
-## Local modifications to upstream
+## Upstream version
 
-> **Principle**: `moqlivecast` is maintained by this project's author. Fixes like the one below
-> should be **committed upstream**, and this repository only bumps the submodule commit. Do not
-> leave patches in the `upstream/` working tree — working-tree edits are not recorded by the parent
-> repository and conflict with `git submodule update`. The patch below is a **stopgap until the
-> fix lands upstream**.
+The submodule is pinned to `eaa6dd3` (moqlivecast `master`), which contains the quic-recovery fix for the
+256KB stack array (originally shipped here as a stopgap patch) plus **upstream H.265 (HEVC) support**.
+**No local patches are applied**, so the submodule is clean after `git submodule update --init`.
 
-Once it is upstreamed, the cleanup is three steps:
+To move to a newer upstream commit:
 
 ```bash
-git -C upstream fetch origin && git -C upstream checkout origin/master   # or a specific commit
-git add upstream && git commit -m "Bump upstream: heap-allocate recovery compact buffer"
-rm -rf patches/0001-quic-recovery-compact-on-heap.patch   # also drop the apply line from the build steps
+git -C upstream fetch origin
+git -C upstream checkout <commit>
+git add upstream && git commit -m "Bump upstream to <commit>"
 ```
 
-Current patch:
-
-```
-patches/0001-quic-recovery-compact-on-heap.patch
-```
-
-**What it changes**: `quic/quic_recovery.c` used to declare, inside `compact_sent_packets()`:
-
-```c
-QuicRecoverySentPacket tmp[QUIC_RECOVERY_MAX_SENT_PACKETS];   // 4096 × 64B = 256KB on the stack
-```
-
-That `static` function is inlined into `on_pto_timer` and `quic_recovery_on_packet_sent`, which sit on the same PTO retransmit chain, for a combined **526,864 B** of stack — more than the 512KB default stack of a non-main thread on macOS, so it hits the guard page (`___chkstk_darwin`; always reproducible against an unreachable port, and also on packet loss during normal playback). The patch heap-allocates the array based on the actual entry count, shrinking the two stack frames from 262KB to 272B / 256B.
-
-Apply it (idempotent — it reports a skip if already applied):
-
-```bash
-git -C upstream apply --check ../patches/0001-quic-recovery-compact-on-heap.patch 2>/dev/null \
-  && git -C upstream apply ../patches/0001-quic-recovery-compact-on-heap.patch
-```
-
-> The thread stack stays at the **platform default**; the problem is not worked around by enlarging it.
 
 ## Local end-to-end testing
 
@@ -326,6 +298,7 @@ python3 -c "import os; print('frames', os.path.getsize('out.yuv')//(640*360*3//2
 - **IPv4 only**: the upstream QUIC stack does not do IPv6; `host` must be an IPv4 literal or a name with an A record
 - **Only tested on macOS**: Windows / Linux are untested (the TLS client skips certificate verification and connects to self-signed servers)
 - **A 128KB stack frame remains on the receive path**: `FeedRaw` in `quic_connection.c` has `pkt_buf[65536] + pkt_orig[65536]`. Measured peak for the receive + decode chain is about 200KB (192KB crashes, 224KB passes), leaving roughly 2.5× headroom on the default 512KB stack, so it is left as is for now
+- **10-bit H.265 goes through one pixel-format conversion**: the renderer only accepts YUV420P (`SDL_UpdateYUVTexture`, three 8-bit planes), so the common `yuv420p10le` output is converted to 8-bit with swscale before display — a per-frame CPU cost, and output is 8-bit
 - **No seek / pause / volume control**: this is a pure live pull player
 - **A timestamp rebase triggers one re-buffer**: when the server switches GOP or resets the timeline you see a short pause (logged as `缓冲中……`); that is expected, not a failure
 - **Audio output lags by roughly `av_sync`**: in sync mode the audio device may hold up to `av_sync` ms of data (aligned with the video buffer); reduce `--av-sync` for lower latency

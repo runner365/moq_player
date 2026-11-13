@@ -34,9 +34,18 @@ extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
+#include <libswscale/swscale.h>
 }
 
 /* ------------------------- 视频解码 ------------------------- */
+
+/* 支持的视频编码。两种都用「长度前缀 + 配置记录」的形式喂进来：
+ *   H.264 → avcC  (AVCDecoderConfigurationRecord)
+ *   H.265 → hvcC  (HEVCDecoderConfigurationRecord)
+ * FFmpeg 靠 extradata 自己识别封装方式，调用方只需原样传 config 和码流。 */
+enum class VideoCodec { kH264 = 0, kH265 = 1 };
+
+const char* VideoCodecName(VideoCodec c);   /* "H.264" / "H.265" */
 
 class VideoDecoder {
 public:
@@ -48,12 +57,13 @@ public:
     VideoDecoder(const VideoDecoder&) = delete;
     VideoDecoder& operator=(const VideoDecoder&) = delete;
 
-    /* avcc 来自 on_stream_ready 的 info->config（H264 轨） */
-    bool Init(const uint8_t* avcc, size_t len, std::string* err);
+    /* config 来自 on_stream_ready 的 info->config：
+     * H.264 轨是 avcC，H.265 轨是 hvcC。codec 须与 config 一致。 */
+    bool Init(VideoCodec codec, const uint8_t* config, size_t len, std::string* err);
 
     void SetFrameCallback(FrameCb cb) { cb_ = std::move(cb); }
 
-    /* 喂一个 AVCC 访问单元；解码出的帧通过回调送出 */
+    /* 喂一个访问单元（4 字节长度前缀的 NAL 序列）；解码出的帧通过回调送出 */
     void Decode(const uint8_t* data, size_t len,
                 int64_t dts_ms, int64_t pts_ms, bool key);
 
@@ -63,20 +73,33 @@ public:
     void Close();
 
     bool opened() const { return opened_; }
+    VideoCodec codec() const { return codec_; }
     int width() const { return width_; }
     int height() const { return height_; }
     uint64_t frames() const { return frames_; }
 
 private:
     void DrainFrames();
+    /* 把非 YUV420P（如 10bit 的 yuv420p10le）转成 YUV420P 再交给渲染层。
+     * 渲染用的是 SDL_UpdateYUVTexture，只接受 8bit 三平面。 */
+    AVFrame* ToYuv420p(AVFrame* in);
 
     AVCodecContext* ctx_ = nullptr;
     AVFrame* frame_ = nullptr;
     FrameCb cb_;
     bool opened_ = false;
+    VideoCodec codec_ = VideoCodec::kH264;
     int width_ = 0;
     int height_ = 0;
     uint64_t frames_ = 0;
+
+    /* 像素格式转换（仅在需要时创建） */
+    SwsContext* sws_ = nullptr;
+    AVFrame*    sws_frame_ = nullptr;
+    int         sws_w_ = 0;
+    int         sws_h_ = 0;
+    int         sws_fmt_ = -1;
+    uint64_t    sws_converted_ = 0;
 };
 
 /* ------------------------- 音频解码 ------------------------- */

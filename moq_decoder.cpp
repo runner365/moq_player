@@ -1,13 +1,17 @@
 /* ============================================================
- * moq_decoder.cpp — H.264 / AAC 解码实现
+ * moq_decoder.cpp — H.264 / H.265 / AAC 解码实现
  *
- * 视频：avcC 作为 extradata，喂 AVCC 数据即可直接解（FFmpeg 的 h264
- *       解码器内置 NALFF 长度前缀拆包，见 h264dec.c / h2645_parse.c）。
+ * 视频：avcC（H.264）或 hvcC（H.265）作为 extradata，喂 4 字节长度前缀的
+ *       NAL 序列即可直接解 —— FFmpeg 的 h264/hevc 解码器遇到这两种配置
+ *       记录会自动进入 NALFF 模式（is_avc/is_nalff + nal_length_size），
+ *       拆包逻辑在 h2645_parse.c 里。
  * 音频：ASC 作为 extradata，喂裸 AAC 帧；输出 FLTP，再经 avfilter
  *       转成目标采样率/声道的 F32 interleaved。
  * ============================================================ */
 
 #include "moq_decoder.h"
+
+#include "logger.h"     /* moqlivecast 的异步日志，与其他模块保持同一出口 */
 
 extern "C" {
 #include <libavutil/opt.h>
@@ -61,12 +65,25 @@ VideoDecoder::~VideoDecoder() {
     Close();
 }
 
-bool VideoDecoder::Init(const uint8_t* avcc, size_t len, std::string* err) {
+const char* VideoCodecName(VideoCodec c) {
+    return c == VideoCodec::kH265 ? "H.265" : "H.264";
+}
+
+bool VideoDecoder::Init(VideoCodec vcodec, const uint8_t* config, size_t len,
+                        std::string* err) {
     if (opened_) return true;
 
-    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    codec_ = vcodec;
+    const AVCodecID id = (vcodec == VideoCodec::kH265) ? AV_CODEC_ID_HEVC
+                                                       : AV_CODEC_ID_H264;
+    const char* name = (vcodec == VideoCodec::kH265) ? "hevc" : "h264";
+
+    const AVCodec* codec = avcodec_find_decoder(id);
     if (!codec) {
-        if (err) *err = "找不到 h264 解码器（FFmpeg 是否启用了 --enable-decoder=h264？）";
+        if (err) {
+            *err = std::string("找不到 ") + name + " 解码器（FFmpeg 是否启用了 "
+                   "--enable-decoder=" + name + "？）";
+        }
         return false;
     }
 
@@ -76,18 +93,22 @@ bool VideoDecoder::Init(const uint8_t* avcc, size_t len, std::string* err) {
         return false;
     }
 
-    /* avcC 作为 extradata：FFmpeg 据此识别出 AVCC 模式
-     * （is_avc=1 + nal_length_size），后续喂长度前缀的包即可 */
-    if (avcc && len > 0) {
+    /* avcC / hvcC 作为 extradata：FFmpeg 据此识别出长度前缀模式
+     * （is_avc / is_nalff + nal_length_size），后续喂长度前缀的包即可 */
+    if (config && len > 0) {
         ctx_->extradata = static_cast<uint8_t*>(av_mallocz(len + AV_INPUT_BUFFER_PADDING_SIZE));
         if (!ctx_->extradata) {
             if (err) *err = "av_mallocz(extradata) 失败";
             return false;
         }
-        memcpy(ctx_->extradata, avcc, len);
+        memcpy(ctx_->extradata, config, len);
         ctx_->extradata_size = static_cast<int>(len);
     } else {
-        if (err) *err = "缺少 avcC extradata，无法初始化解码器";
+        if (err) {
+            *err = std::string("缺少 ") +
+                   (vcodec == VideoCodec::kH265 ? "hvcC" : "avcC") +
+                   " extradata，无法初始化解码器";
+        }
         return false;
     }
 
@@ -96,7 +117,7 @@ bool VideoDecoder::Init(const uint8_t* avcc, size_t len, std::string* err) {
 
     int ret = avcodec_open2(ctx_, codec, nullptr);
     if (ret < 0) {
-        if (err) *err = "avcodec_open2(h264) 失败: " + AvErr(ret);
+        if (err) *err = std::string("avcodec_open2(") + name + ") 失败: " + AvErr(ret);
         return false;
     }
 
@@ -139,6 +160,58 @@ void VideoDecoder::Decode(const uint8_t* data, size_t len,
     DrainFrames();
 }
 
+/* 渲染侧只吃 YUV420P（SDL_UpdateYUVTexture 三平面 8bit）。
+ * HEVC 常见 10bit（yuv420p10le）甚至 4:2:2/4:4:4，这里统一用 swscale 转一次；
+ * 已经是 YUV420P 的帧直接返回，不做任何拷贝。 */
+AVFrame* VideoDecoder::ToYuv420p(AVFrame* in) {
+    if (!in) return nullptr;
+    if (in->format == AV_PIX_FMT_YUV420P) return in;
+
+    const int w = in->width;
+    const int h = in->height;
+    if (w <= 0 || h <= 0) return nullptr;
+
+    if (!sws_ || sws_w_ != w || sws_h_ != h || sws_fmt_ != in->format) {
+        if (sws_) {
+            sws_freeContext(sws_);
+            sws_ = nullptr;
+        }
+        sws_ = sws_getContext(w, h, static_cast<AVPixelFormat>(in->format),
+                              w, h, AV_PIX_FMT_YUV420P,
+                              SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_) {
+            LOG_ERROR("像素格式转换器创建失败（%s %dx%d），无法上屏",
+                      av_get_pix_fmt_name(static_cast<AVPixelFormat>(in->format)), w, h);
+            return nullptr;
+        }
+        sws_w_   = w;
+        sws_h_   = h;
+        sws_fmt_ = in->format;
+
+        if (!sws_frame_) {
+            sws_frame_ = av_frame_alloc();
+            if (!sws_frame_) return nullptr;
+        }
+        av_frame_unref(sws_frame_);
+        sws_frame_->format = AV_PIX_FMT_YUV420P;
+        sws_frame_->width  = w;
+        sws_frame_->height = h;
+        if (av_frame_get_buffer(sws_frame_, 0) < 0) {
+            LOG_ERROR("为像素格式转换分配帧失败");
+            return nullptr;
+        }
+        LOG_INFO("视频像素格式 %s 不是 YUV420P，已启用转换路径（%dx%d）",
+                 av_get_pix_fmt_name(static_cast<AVPixelFormat>(in->format)), w, h);
+    }
+
+    sws_scale(sws_, in->data, in->linesize, 0, h,
+              sws_frame_->data, sws_frame_->linesize);
+    sws_frame_->pts = in->pts;
+    sws_frame_->best_effort_timestamp = in->best_effort_timestamp;
+    sws_converted_++;
+    return sws_frame_;
+}
+
 void VideoDecoder::DrainFrames() {
     for (;;) {
         int ret = avcodec_receive_frame(ctx_, frame_);
@@ -148,7 +221,9 @@ void VideoDecoder::DrainFrames() {
         width_ = frame_->width;
         height_ = frame_->height;
         frames_++;
-        if (cb_) cb_(frame_);
+
+        AVFrame* out = ToYuv420p(frame_);
+        if (out && cb_) cb_(out);
         av_frame_unref(frame_);
     }
 }
@@ -160,6 +235,16 @@ void VideoDecoder::Flush() {
 }
 
 void VideoDecoder::Close() {
+    if (sws_frame_) {
+        av_frame_free(&sws_frame_);
+        sws_frame_ = nullptr;
+    }
+    if (sws_) {
+        sws_freeContext(sws_);
+        sws_ = nullptr;
+    }
+    sws_w_ = sws_h_ = 0;
+    sws_fmt_ = -1;
     if (frame_) {
         av_frame_free(&frame_);
         frame_ = nullptr;

@@ -18,7 +18,8 @@
 ## 特性
 
 - **拉流**：SUBSCRIBE 到 `app/stream`，自动解析 `avcC` / AudioSpecificConfig 并打印编解码参数
-- **解码**：FFmpeg 8.0.1，H.264 输出 YUV420P、AAC 输出 PCM；无需 Annex-B / ADTS 转换
+- **解码**：FFmpeg 8.0.1，支持 **H.264 / H.265(HEVC)** 视频与 AAC 音频，输出 YUV420P + PCM；无需 Annex-B / ADTS 转换
+- **编码自适应**：直接采用 SDK 上报的 `moqt_stream_t::codec`（`MOQT_CODEC_H264` / `MOQT_CODEC_H265`）选择解码器，无需命令行开关；配置记录仅用于日志与一致性校验
 - **音频重采样**：`avfilter`（`aresample` + `aformat`）从 44.1kHz FLTP 转为设备可播的 48kHz 立体声 F32
 - **渲染**：SDL3 `SDL_UpdateYUVTexture` 直传 YUV420P，不经过 swscale 转 RGB
 - **音视频同步**：开关式，默认直通（最低延迟），可选预缓冲 N 毫秒后按 pts 精确对齐
@@ -36,7 +37,7 @@
 | libuv | 上游自带 | `upstream/3rdparty/libuv` |
 | moqlivecast SDK | commit 见 submodule | `upstream/`（git submodule） |
 
-FFmpeg 以最小配置编译（仅 H.264/AAC 解码 + avfilter + swresample），约 2 分钟；产物安装到 `build/ffmpeg/install`。
+FFmpeg 以最小配置编译（H.264/H.265/AAC 解码 + avfilter + swresample + swscale），约 2 分钟；产物安装到 `build/ffmpeg/install`。
 
 ## 构建
 
@@ -44,11 +45,7 @@ FFmpeg 以最小配置编译（仅 H.264/AAC 解码 + avfilter + swresample）�
 # 1. 拉取上游 SDK（首次 clone 后必须执行）
 git submodule update --init --recursive
 
-# 2. 应用上游补丁（新拉的 submodule 没有本地修改，不打会在丢包/连不上时崩溃）
-git -C upstream apply ../patches/0001-quic-recovery-compact-on-heap.patch 2>/dev/null \
-  || echo "补丁已应用，跳过"
-
-# 3. 配置 + 编译
+# 2. 配置 + 编译
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8
 ```
@@ -154,8 +151,9 @@ build/ffmpeg/install/             # FFmpeg 静态库 + 头文件
 
 | 项 | SDK 给什么 | 我们怎么用 |
 |---|---|---|
-| 视频码流 | **AVCC**：4 字节长度前缀 + NAL（非 Annex-B） | 原样 `avcodec_send_packet`，不带转换 |
-| 视频配置 | `avcC`（含 SPS/PPS） | 直接作为 `extradata`，FFmpeg 自动识别 AVCC 模式并内置拆包 |
+| 视频编码 | H.264 或 **H.265(HEVC)**，SDK 通过 `moqt_stream_t::codec` 上报 | 直接据此选择解码器；配置记录（`avcC`/`hvcC`）不一致时打一条 WARN 便于排查 |
+| 视频码流 | **长度前缀 NAL**（4 字节长度 + NAL，非 Annex-B），两种编码一致 | 原样 `avcodec_send_packet`，不带转换 |
+| 视频配置 | `avcC`（H.264，含 SPS/PPS）或 `hvcC`（H.265，含 VPS/SPS/PPS） | 直接作为 `extradata`，FFmpeg 自动识别长度前缀模式并内置拆包 |
 | 音频码流 | **裸 AAC 帧**，无 ADTS 头 | 原样送解码器 |
 | 音频配置 | AudioSpecificConfig（AAC-LC / 采样率 / 声道） | 作为 `extradata`，并自解析用于日志 |
 | 时间戳 | `dts_ms` / `pts_ms`，单位毫秒 | 队列排序与同步基线，见下 |
@@ -203,7 +201,6 @@ build/ffmpeg/install/             # FFmpeg 静态库 + 头文件
 ├── moq_render.h / moq_render.cpp        # 播放层：FrameQueue / VideoSink / AudioSink / Player
 ├── README.md                            # 英文版
 ├── README_cn.md                         # 本文件（中文版）
-├── patches/                             # 对 upstream 的本地修改补丁
 ├── 3rdparty/
 │   ├── ffmpeg.tar.gz                    # FFmpeg 8.0.1 源码包（构建输入）
 │   └── SDL3-3.4.20.tar.gz               # SDL3 源码包（构建输入）
@@ -211,44 +208,22 @@ build/ffmpeg/install/             # FFmpeg 静态库 + 头文件
 └── requirement.md                       # 原始需求
 ```
 
-`upstream/` 是 git submodule（`.gitmodules` + gitlink 管理），**不要**把它加进 `.gitignore`，也不要手动删改；需要改上游代码时见下节。
+`upstream/` 是 git submodule（`.gitmodules` + gitlink 管理），**不要**把它加进 `.gitignore`，也不要手动删改；需要升级上游版本时见下节。
 
-## 对 upstream 的本地修改
+## 上游版本
 
-> **原则**：`moqlivecast` 由本项目作者维护。这类问题应**直接提交到上游仓库**，本仓库只更新
-> submodule 指向的 commit，不在 `upstream/` 工作区留补丁（工作区改动不会被父仓库记录，
-> 还会与 `git submodule update` 冲突）。下面的补丁是**上游合入前的临时措施**。
+submodule 固定在 `eaa6dd3`（moqlivecast `master`），包含 quic-recovery 的 256KB 栈数组修复，以及 **H.265(HEVC) 的上游支持**
+（最初在本仓库以临时补丁形式存在，现已合入上游）。**本仓库不再打任何补丁**，执行
+`git submodule update --init` 后子模块工作区是干净的。
 
-上游合入后，收尾只要三步：
-
-```bash
-git -C upstream fetch origin && git -C upstream checkout origin/master   # 或指定的 commit
-git add upstream && git commit -m "Bump upstream: heap-allocate recovery compact buffer"
-rm -rf patches/0001-quic-recovery-compact-on-heap.patch    # 并删掉 README 构建步骤里的 apply 行
-```
-
-当前补丁：
-
-```
-patches/0001-quic-recovery-compact-on-heap.patch
-```
-
-**改了什么**：`quic/quic_recovery.c` 的 `compact_sent_packets()` 里原本有
-
-```c
-QuicRecoverySentPacket tmp[QUIC_RECOVERY_MAX_SENT_PACKETS];   // 4096 × 64B = 256KB，在栈上
-```
-
-该 `static` 函数被内联进 `on_pto_timer` 和 `quic_recovery_on_packet_sent`，两者又恰好在同一条 PTO 重传链上，合计 **526,864 B** 栈开销，超过 macOS 非主线程默认的 512KB 栈 → 踩 guard page 崩溃（`___chkstk_darwin`，发给不可达端口必现；正常播放时丢包触发 PTO 同样会崩）。补丁把它改成按实际条目数 `malloc`，两个函数栈帧从 262KB 降到 272B / 256B。
-
-应用方式（幂等，已打过会提示 skip）：
+需要升级到更新的上游提交时：
 
 ```bash
-git -C upstream apply --check ../patches/0001-quic-recovery-compact-on-heap.patch 2>/dev/null \
-  && git -C upstream apply ../patches/0001-quic-recovery-compact-on-heap.patch
+git -C upstream fetch origin
+git -C upstream checkout <commit>
+git add upstream && git commit -m "Bump upstream to <commit>"
 ```
 
-> 线程栈保持**平台默认**，不通过放大栈来绕过问题。
 
 ## 本地端到端联调
 
@@ -320,6 +295,7 @@ python3 -c "import os; print('帧数', os.path.getsize('out.yuv')//(640*360*3//2
 - **仅支持 IPv4**：上游 QUIC 栈不做 IPv6，host 需为 IPv4 字面量或能解析出 A 记录的域名
 - **只验证过 macOS**：Windows / Linux 未测（TLS 客户端跳过证书校验，自签证书直连）
 - **接收路径仍有 128KB 栈帧**：`quic_connection.c` 的 `FeedRaw` 有 `pkt_buf[65536] + pkt_orig[65536]`；实测接收+解码链峰值约 200KB（192KB 栈崩、224KB 通过），默认 512KB 下约 2.5× 余量，暂未改
+- **10bit H.265 会做一次像素格式转换**：渲染层只吃 YUV420P（`SDL_UpdateYUVTexture` 三平面 8bit），HEVC 常见的 `yuv420p10le` 会用 swscale 转成 8bit 再上屏，有一次性 CPU 开销，画质按 8bit 呈现
 - **无 seek / 暂停 / 音量控制**：当前是纯直播拉流播放器
 - **时间戳 rebase 会触发一次重新缓冲**：服务端切换 GOP/时间轴重置时，表现为短暂停顿（日志有 `缓冲中……`），不是故障
 - **音频有 `av_sync` 量级的出声延迟**：同步模式下音频设备最多积压 `av_sync` 毫秒（与视频缓冲对齐），要更低延迟请减小 `--av-sync`

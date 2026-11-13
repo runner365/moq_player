@@ -164,8 +164,8 @@ ExternalProject_Add(ffmpeg_ext
                                --disable-doc
                                --disable-network
                                --disable-everything
-                               --enable-decoder=h264,aac
-                               --enable-parser=h264
+                               --enable-decoder=h264,hevc,aac
+                               --enable-parser=h264,hevc
                                --enable-avfilter
                                --enable-filter=aresample,aformat,anull
                                --enable-swresample
