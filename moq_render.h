@@ -168,7 +168,10 @@ public:
     Player& operator=(const Player&) = delete;
 
     /* 主线程调用。av_sync_ms = 0 表示直通，>0 表示预缓冲该毫秒数 */
-    bool Init(int av_sync_ms, int out_rate, int out_channels, std::string* err);
+    /* video_enabled / audio_enabled 对应 --audio-only / --video-only：
+     * 关闭的那一路不建解码器、不建窗口/音频设备，也不进队列。 */
+    bool Init(int av_sync_ms, int out_rate, int out_channels,
+              bool video_enabled, bool audio_enabled, std::string* err);
 
     /* 以下两个由后台解码线程调用，内部加锁 */
     void PushVideo(const AVFrame* frame, int64_t pts_ms);
@@ -211,6 +214,7 @@ private:
     bool PollEvents();
     void FeedAudio();
     void RenderVideo();
+    void MaybeStartPlayback();   /* 预缓冲判定 → 起播（与是否渲染视频无关） */
     void AfterRender();
 
     /* 当前媒体时钟（毫秒）。有音频时以音频播放位置为准，否则用墙钟 */
@@ -246,6 +250,8 @@ private:
     int64_t last_clk_log_ms_  = 0;   /* 时钟诊断日志节流（调试用） */
     int64_t last_clock_ms_    = 0;   /* 上一次返回的时钟，用于单调保护 */
 
+    bool    video_enabled_ = true;
+    bool    audio_enabled_ = true;
     bool    rebuffering_        = false;  /* 是否处于重新缓冲（暂停）状态 */
     int64_t rebuffer_target_ms_ = 0;      /* 恢复播放所需的缓冲深度 */
     int64_t rebuffer_start_ms_  = 0;      /* 进入重新缓冲的时刻（墙钟） */

@@ -32,8 +32,8 @@
  *   stream     流名
  *
  * 选项：
- *   --av-sync <ms>      音视频同步开关：0=直通（默认，最低延迟），
- *                       >0=预缓冲该毫秒数后按 pts 精确同步（如 2000）
+ *   --av-sync <ms>      音视频同步缓冲：默认 500（预缓冲该毫秒数后按 pts 精确同步），
+ *                       0=直通（不预缓冲，最低延迟）
  *   --path <p>          WebTransport 路径，默认 /moq
  *   --duration <sec>    运行 N 秒后自动退出（默认一直跑到 Ctrl-C/关窗）
  *   --out-rate <hz>     avfilter 音频输出采样率，默认 48000
@@ -300,7 +300,9 @@ struct App {
 
     int  out_rate     = 48000;
     int  out_channels = 2;
-    int  av_sync_ms   = 0;
+    int  av_sync_ms   = 500;   /* 默认 500ms 预缓冲同步；0 = 直通 */
+    bool video_only   = false; /* --video-only：只解视频，不开音频设备 */
+    bool audio_only   = false; /* --audio-only：只解音频，不建窗口 */
     std::string snapshot_path;   /* 渲染快照（验证用） */
 
     std::atomic<bool> failed{false};
@@ -573,6 +575,10 @@ void OnStreamReady(moqt_client_t*, moqt_stream_t* s,
 
     std::string err;
     if (IsVideoCodec(info->codec)) {
+        if (a->audio_only) {
+            LOG_INFO("--audio-only：跳过视频解码器");
+            return;
+        }
         if (!a->vdec) {
             if (a->vconfig_kind == ConfigKind::kUnknown) {
                 LOG_WARN("视频配置记录格式无法识别，按 H.264 尝试解码"
@@ -592,6 +598,10 @@ void OnStreamReady(moqt_client_t*, moqt_stream_t* s,
             }
         }
     } else {
+        if (a->video_only) {
+            LOG_INFO("--video-only：跳过音频解码器");
+            return;
+        }
         if (!a->adec) {
             a->adec.reset(new AudioDecoder());
             a->adec->SetFrameCallback([a](AVFrame* f) { OnAudioFrame(a, f); });
@@ -820,7 +830,9 @@ void Usage(const char* argv0) {
     LOG_ERROR("用法: %s <host> <port> <app> <stream> [选项]", argv0);
     LOG_ERROR("  host 可为 IPv4 地址或域名（QUIC 栈仅支持 IPv4）");
     LOG_ERROR("选项:");
-    LOG_ERROR("  --av-sync <ms>      0=直通（默认，最低延迟），>0=预缓冲后精确同步（如 2000）");
+    LOG_ERROR("  --av-sync <ms>      同步缓冲毫秒数，默认 500；0=直通（最低延迟），如 2000");
+    LOG_ERROR("  --video-only        只播放视频（不打开音频设备、不解音频）");
+    LOG_ERROR("  --audio-only        只播放音频（不创建窗口、不解视频）");
     LOG_ERROR("  --path <p>          WebTransport 路径，默认 /moq");
     LOG_ERROR("  --duration <sec>    运行 N 秒后退出（默认跑到关窗/ESC/Ctrl-C）");
     LOG_ERROR("  --out-rate <hz>     avfilter 音频输出采样率，默认 48000");
@@ -877,6 +889,10 @@ int main(int argc, char** argv) {
     for (int i = 5; i < argc; ++i) {
         if (strcmp(argv[i], "--av-sync") == 0 && i + 1 < argc) {
             a.av_sync_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--video-only") == 0) {
+            a.video_only = true;
+        } else if (strcmp(argv[i], "--audio-only") == 0) {
+            a.audio_only = true;
         } else if (strcmp(argv[i], "--path") == 0 && i + 1 < argc) {
             a.path = argv[++i];
         } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
@@ -919,6 +935,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (a.video_only && a.audio_only) {
+        LOG_ERROR("--video-only 与 --audio-only 不能同时使用");
+        log_shutdown();
+        return 1;
+    }
     if (a.port <= 0 || a.port > 65535) {
         LOG_ERROR("端口非法: %d", a.port);
         log_shutdown();
@@ -948,6 +969,8 @@ int main(int argc, char** argv) {
              a.av_sync_ms,
              a.av_sync_ms > 0 ? a.av_sync_ms * 2 : 500,
              a.av_sync_ms > 0 ? a.av_sync_ms : 0);
+    LOG_INFO(" 轨道    : %s", a.audio_only ? "仅音频（--audio-only）"
+                              : a.video_only ? "仅视频（--video-only）" : "音频 + 视频");
     LOG_INFO(" 构建    : %s %s", __DATE__, __TIME__);
     LOG_INFO("----------------------------------------");
 
@@ -955,7 +978,8 @@ int main(int argc, char** argv) {
     Player player;
     {
         std::string err;
-        if (!player.Init(a.av_sync_ms, a.out_rate, a.out_channels, &err)) {
+        if (!player.Init(a.av_sync_ms, a.out_rate, a.out_channels,
+                         !a.audio_only, !a.video_only, &err)) {
             LOG_ERROR("播放器初始化失败: %s", err.c_str());
             log_shutdown();
             return 1;

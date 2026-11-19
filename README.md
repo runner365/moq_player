@@ -22,7 +22,7 @@ The protocol layer is the upstream C SDK [`runner365/moqlivecast`](https://githu
 - **Codec selection**: taken straight from the SDK's `moqt_stream_t::codec` (`MOQT_CODEC_H264` / `MOQT_CODEC_H265`); the config record is only used for log formatting and a consistency warning — no command-line switch needed
 - **Audio resampling**: `avfilter` (`aresample` + `aformat`) converts 44.1kHz FLTP into device-ready 48kHz stereo F32
 - **Rendering**: SDL3 `SDL_UpdateYUVTexture` consumes YUV420P directly — no swscale RGB conversion
-- **A/V sync**: optional. Default is passthrough (lowest latency); with `--av-sync N` it pre-buffers N ms and aligns video to the master clock by pts
+- **A/V sync**: pre-buffers 500 ms by default, then aligns video to the master clock by pts; `--av-sync 0` switches to passthrough (lowest latency)
 - **Observability**: all logging goes through moqlivecast's async logger, with per-second rate / queue depth / drop statistics; YUV/PCM dumping and render snapshots are available for regression checks
 
 ## Dependencies
@@ -68,14 +68,18 @@ You can point to a different upstream copy with `-DMOQ_UPSTREAM_DIR=/path/to/moq
 Examples:
 
 ```bash
-# Default passthrough mode (lowest latency)
+# Default: 500 ms sync buffer
 ./build/bin/moq_player 127.0.0.1 4433 live demo
 
-# Precise sync with a 500ms pre-buffer
-./build/bin/moq_player 127.0.0.1 4433 live demo --av-sync 500
+# Passthrough (no pre-buffer, lowest latency)
+./build/bin/moq_player 127.0.0.1 4433 live demo --av-sync 0
 
-# 2 second pre-buffer
+# Larger buffer, more jitter tolerance
 ./build/bin/moq_player 127.0.0.1 4433 live demo --av-sync 2000
+
+# Audio only (no window) or video only (no audio device)
+./build/bin/moq_player 127.0.0.1 4433 live demo --audio-only
+./build/bin/moq_player 127.0.0.1 4433 live demo --video-only
 ```
 
 Press **ESC** in the window or close it to exit; **Ctrl-C** in the terminal also works (every exit path releases resources cleanly and prints a summary).
@@ -84,7 +88,9 @@ Press **ESC** in the window or close it to exit; **Ctrl-C** in the terminal also
 
 | Option | Description | Default |
 |---|---|---|
-| `--av-sync <ms>` | `0` = passthrough (no pre-buffer, lowest latency); `>0` = pre-buffer that many milliseconds, then align by pts | `0` |
+| `--av-sync <ms>` | Pre-buffer that many milliseconds, then align by pts; `0` = passthrough (no pre-buffer, lowest latency) | `500` |
+| `--video-only` | Play video only: no AAC decode, no audio device | — |
+| `--audio-only` | Play audio only: no video decode, no window | — |
 | `--path <p>` | WebTransport path | `/moq` |
 | `--duration <sec>` | Exit after N seconds | Runs until window close / ESC / Ctrl-C |
 | `--out-rate <hz>` | avfilter audio output sample rate | `48000` |
@@ -173,7 +179,7 @@ Two independent queues (video / audio) hold decoded `AVFrame`s ordered by `pts_m
   - The head *is* the playback position. Dropping the head is a silent seek: the head moves ahead of the clock and never becomes "due" again → the picture freezes on one frame
   - Genuinely late frames are handled by `DropBefore(clock - 300ms)`, where the clock has already passed them, so dropping is safe
 
-| | `av_sync = 0` (default, passthrough) | `av_sync > 0` (pre-buffered sync) |
+| | `av_sync = 0` (passthrough) | `av_sync > 0` (pre-buffered sync, **default 500**) |
 |---|---|---|
 | Start | Render as soon as decoded | Start after `av_sync` ms are buffered |
 | Video | Render immediately; queue window 500ms, cap 30 frames | Align to master clock by pts; window `av_sync × 2`, cap 120 frames |
@@ -299,6 +305,7 @@ python3 -c "import os; print('frames', os.path.getsize('out.yuv')//(640*360*3//2
 - **Only tested on macOS**: Windows / Linux are untested (the TLS client skips certificate verification and connects to self-signed servers)
 - **A 128KB stack frame remains on the receive path**: `FeedRaw` in `quic_connection.c` has `pkt_buf[65536] + pkt_orig[65536]`. Measured peak for the receive + decode chain is about 200KB (192KB crashes, 224KB passes), leaving roughly 2.5× headroom on the default 512KB stack, so it is left as is for now
 - **10-bit H.265 goes through one pixel-format conversion**: the renderer only accepts YUV420P (`SDL_UpdateYUVTexture`, three 8-bit planes), so the common `yuv420p10le` output is converted to 8-bit with swscale before display — a per-frame CPU cost, and output is 8-bit
+- **`--video-only` / `--audio-only` only affect the playback side**: the SDK always SUBSCRIBEs to both the video and audio tracks (`moq_transport_client.c` sends both requests), so the unused track still consumes bandwidth — it is just not decoded or played
 - **No seek / pause / volume control**: this is a pure live pull player
 - **A timestamp rebase triggers one re-buffer**: when the server switches GOP or resets the timeline you see a short pause (logged as `缓冲中……`); that is expected, not a failure
 - **Audio output lags by roughly `av_sync`**: in sync mode the audio device may hold up to `av_sync` ms of data (aligned with the video buffer); reduce `--av-sync` for lower latency

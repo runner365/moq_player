@@ -22,7 +22,7 @@
 - **编码自适应**：直接采用 SDK 上报的 `moqt_stream_t::codec`（`MOQT_CODEC_H264` / `MOQT_CODEC_H265`）选择解码器，无需命令行开关；配置记录仅用于日志与一致性校验
 - **音频重采样**：`avfilter`（`aresample` + `aformat`）从 44.1kHz FLTP 转为设备可播的 48kHz 立体声 F32
 - **渲染**：SDL3 `SDL_UpdateYUVTexture` 直传 YUV420P，不经过 swscale 转 RGB
-- **音视频同步**：开关式，默认直通（最低延迟），可选预缓冲 N 毫秒后按 pts 精确对齐
+- **音视频同步**：默认 500ms 预缓冲后按 pts 精确对齐；`--av-sync 0` 可切成直通（最低延迟）
 - **可观测**：统一走 moqlivecast 的异步 logger，带每秒速率/队列深度/丢弃统计；支持落盘 YUV/PCM 和渲染快照做回归比对
 
 ## 依赖
@@ -68,14 +68,18 @@ build/ffmpeg/install/             # FFmpeg 静态库 + 头文件
 示例：
 
 ```bash
-# 默认直通模式（最低延迟）
+# 默认：500ms 同步缓冲
 ./build/bin/moq_player 127.0.0.1 4433 live demo
 
-# 精确同步，预缓冲 500ms
-./build/bin/moq_player 127.0.0.1 4433 live demo --av-sync 500
+# 直通模式（不预缓冲，最低延迟）
+./build/bin/moq_player 127.0.0.1 4433 live demo --av-sync 0
 
-# 预缓冲 2 秒
+# 更大缓冲，抗抖动更强
 ./build/bin/moq_player 127.0.0.1 4433 live demo --av-sync 2000
+
+# 只听音频（不开窗口），或只看视频（不开音频设备）
+./build/bin/moq_player 127.0.0.1 4433 live demo --audio-only
+./build/bin/moq_player 127.0.0.1 4433 live demo --video-only
 ```
 
 窗口内按 **ESC** 或关闭窗口退出；终端里 **Ctrl-C** 也可（所有退出路径都会干净释放并打印汇总）。
@@ -84,7 +88,9 @@ build/ffmpeg/install/             # FFmpeg 静态库 + 头文件
 
 | 参数 | 说明 | 默认 |
 |---|---|---|
-| `--av-sync <ms>` | `0` = 直通（不预缓冲，最低延迟）；`>0` = 预缓冲该毫秒数后按 pts 精确同步 | `0` |
+| `--av-sync <ms>` | 预缓冲该毫秒数后按 pts 精确同步；`0` = 直通（不预缓冲，最低延迟） | `500` |
+| `--video-only` | 只播放视频：不解 AAC、不打开音频设备 | — |
+| `--audio-only` | 只播放音频：不解视频、不创建窗口 | — |
 | `--path <p>` | WebTransport 路径 | `/moq` |
 | `--duration <sec>` | 运行 N 秒后自动退出 | 跑到关窗/ESC/Ctrl-C |
 | `--out-rate <hz>` | avfilter 音频输出采样率 | `48000` |
@@ -170,7 +176,7 @@ build/ffmpeg/install/             # FFmpeg 静态库 + 头文件
   - 队首就是播放位置。丢队首等于在不通知时钟的情况下来一次 seek，会让队首永久领先时钟 → 画面定格在某一帧
   - 真正“已迟到”的帧由 `DropBefore(clock - 300ms)` 处理：那是时钟已经越过它们，丢弃不会让播放位置失控
 
-| | `av_sync = 0`（默认，直通） | `av_sync > 0`（预缓冲同步） |
+| | `av_sync = 0`（直通） | `av_sync > 0`（预缓冲同步，**默认 500**） |
 |---|---|---|
 | 起播 | 解码完立刻渲染 | 攒满 `av_sync` 毫秒后起播 |
 | 视频 | 解码即上屏；队列窗口 500ms，上限 30 帧 | 按 pts 对齐主时钟；队列窗口 `av_sync × 2`，上限 120 帧 |
@@ -296,6 +302,7 @@ python3 -c "import os; print('帧数', os.path.getsize('out.yuv')//(640*360*3//2
 - **只验证过 macOS**：Windows / Linux 未测（TLS 客户端跳过证书校验，自签证书直连）
 - **接收路径仍有 128KB 栈帧**：`quic_connection.c` 的 `FeedRaw` 有 `pkt_buf[65536] + pkt_orig[65536]`；实测接收+解码链峰值约 200KB（192KB 栈崩、224KB 通过），默认 512KB 下约 2.5× 余量，暂未改
 - **10bit H.265 会做一次像素格式转换**：渲染层只吃 YUV420P（`SDL_UpdateYUVTexture` 三平面 8bit），HEVC 常见的 `yuv420p10le` 会用 swscale 转成 8bit 再上屏，有一次性 CPU 开销，画质按 8bit 呈现
+- **`--video-only` / `--audio-only` 只影响播放侧**：SDK 在 SUBSCRIBE 时会同时订阅 video 与 audio 两路（`moq_transport_client.c` 里固定发两条 SUBSCRIBE），所以另一路的带宽照旧消耗，只是不解码、不播放
 - **无 seek / 暂停 / 音量控制**：当前是纯直播拉流播放器
 - **时间戳 rebase 会触发一次重新缓冲**：服务端切换 GOP/时间轴重置时，表现为短暂停顿（日志有 `缓冲中……`），不是故障
 - **音频有 `av_sync` 量级的出声延迟**：同步模式下音频设备最多积压 `av_sync` 毫秒（与视频缓冲对齐），要更低延迟请减小 `--av-sync`

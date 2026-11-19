@@ -371,8 +371,11 @@ void Player::Shutdown() {
     SDL_Quit();
 }
 
-bool Player::Init(int av_sync_ms, int out_rate, int out_channels, std::string* err) {
-    av_sync_ms_ = av_sync_ms > 0 ? av_sync_ms : 0;
+bool Player::Init(int av_sync_ms, int out_rate, int out_channels,
+                  bool video_enabled, bool audio_enabled, std::string* err) {
+    av_sync_ms_   = av_sync_ms > 0 ? av_sync_ms : 0;
+    video_enabled_ = video_enabled;
+    audio_enabled_ = audio_enabled;
     out_rate_ = out_rate;
     out_channels_ = out_channels;
 
@@ -391,9 +394,15 @@ bool Player::Init(int av_sync_ms, int out_rate, int out_channels, std::string* e
     rebuffer_target_ms_ = av_sync_ms_ > 0 ? av_sync_ms_ : 0;
     if (rebuffer_target_ms_ > 0 && rebuffer_target_ms_ < 300) rebuffer_target_ms_ = 300;
 
-    if (!video_sink_.Init(err)) return false;
+    if (video_enabled_) {
+        if (!video_sink_.Init(err)) return false;
+    } else {
+        LOG_INFO("--audio-only：不创建窗口与视频渲染器");
+    }
 
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+    if (!audio_enabled_) {
+        LOG_INFO("--video-only：不打开音频设备");
+    } else if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         LOG_WARN("SDL 音频子系统初始化失败: %s（将无声播放）", SDL_GetError());
     } else {
         std::string aerr;
@@ -408,6 +417,12 @@ bool Player::Init(int av_sync_ms, int out_rate, int out_channels, std::string* e
 }
 
 const char* Player::mode_name() const {
+    if (!video_enabled_) {
+        return av_sync_ms_ > 0 ? "仅音频 · av_sync 精确同步" : "仅音频 · 直通";
+    }
+    if (!audio_enabled_) {
+        return av_sync_ms_ > 0 ? "仅视频 · av_sync 精确同步" : "仅视频 · 直通";
+    }
     return av_sync_ms_ > 0 ? "av_sync 精确同步" : "直通（最低延迟）";
 }
 
@@ -592,9 +607,11 @@ void Player::FeedAudio() {
     }
 }
 
-void Player::RenderVideo() {
-    /* ---- 同步模式：先攒够缓冲再起播 ---- */
-    if (av_sync_ms_ > 0 && !started_) {
+/* 预缓冲判定 → 确定锚点并放行。
+ * 与「是否渲染视频」解耦：纯音频（--audio-only）也要靠它起播， */
+void Player::MaybeStartPlayback() {
+    if (av_sync_ms_ <= 0 || started_) return;
+    {
         const bool v_ready = video_q_.BufferedMs() >= av_sync_ms_;
         /* 纯音频流（没有视频轨）也要能起播 */
         const bool a_only_ready = video_q_.Empty() &&
@@ -630,8 +647,12 @@ void Player::RenderVideo() {
                  anchor_pts_, video_q_.BufferedMs(), dv, da,
                  input_done_ ? "（输入已结束，按现有缓冲起播）" : "");
         dropped_ += static_cast<uint64_t>(dv + da);
-        return;
     }
+}
+
+void Player::RenderVideo() {
+    if (!video_enabled_) return;   /* --audio-only：不解码也不渲染 */
+    if (!started_) return;         /* 同步模式下等预缓冲（由 MaybeStartPlayback 放行） */
 
     if (video_q_.Empty()) return;
 
@@ -741,8 +762,9 @@ void Player::AfterRender() {
 bool Player::Iterate() {
     if (!PollEvents()) return false;
 
+    MaybeStartPlayback();
     FeedAudio();
-    RenderVideo();
+    if (video_enabled_) RenderVideo();
     LogDiag();
 
     /* 没到点的帧可渲染时，vsync 会自己节流；无帧可渲时歇 1ms 避免空转 */
